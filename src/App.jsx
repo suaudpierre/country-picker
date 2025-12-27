@@ -1,9 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
-
-function uid() {
-  return crypto.randomUUID?.() ?? String(Date.now() + Math.random());
-}
+import { supabase } from "./supabase";
 
 function splitBulk(text) {
   return text
@@ -17,33 +14,15 @@ export default function App() {
   const [name, setName] = useState("");
   const [bulkText, setBulkText] = useState("");
 
-  const [cards, setCards] = useState(() => {
-    const raw = localStorage.getItem("country-picker.cards");
-    return raw ? JSON.parse(raw) : [];
-  });
-
+  const [cards, setCards] = useState([]);
   const [pickedId, setPickedId] = useState(null);
 
-  // rolling (working baseline + hard stop)
+  // rolling baseline (working)
   const [isRolling, setIsRolling] = useState(false);
   const [rollingName, setRollingName] = useState("");
   const rollingTimerRef = useRef(null);
-  const hardStopTimerRef = useRef(null);
 
-  // IMPORTANT: refs to avoid stale state in timeouts
-  const isRollingRef = useRef(false);
-  const lastShownRef = useRef(null); // {id, name}
-
-  useEffect(() => {
-    localStorage.setItem("country-picker.cards", JSON.stringify(cards));
-  }, [cards]);
-
-  useEffect(() => {
-    return () => {
-      if (rollingTimerRef.current) clearTimeout(rollingTimerRef.current);
-      if (hardStopTimerRef.current) clearTimeout(hardStopTimerRef.current);
-    };
-  }, []);
+  const [loading, setLoading] = useState(true);
 
   const uncheckedCards = useMemo(() => cards.filter((c) => !c.done), [cards]);
 
@@ -52,127 +31,132 @@ export default function App() {
     [pickedId, cards]
   );
 
-  function addCard() {
+  // --- Supabase: load all cards ---
+  async function loadCards() {
+    setLoading(true);
+    const { data, error } = await supabase
+      .from("cards")
+      .select("*")
+      .order("done", { ascending: true })
+      .order("created_at", { ascending: true });
+
+    if (error) {
+      console.error(error);
+      alert("Could not load cards from Supabase. Check console + env vars.");
+      setLoading(false);
+      return;
+    }
+
+    setCards(data ?? []);
+    setLoading(false);
+  }
+
+  useEffect(() => {
+    loadCards();
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (rollingTimerRef.current) clearTimeout(rollingTimerRef.current);
+    };
+  }, []);
+
+  // --- Supabase: create ---
+  async function addCard() {
     const trimmed = name.trim();
     if (!trimmed) return;
 
-    const exists = cards.some(
-      (c) => c.name.toLowerCase() === trimmed.toLowerCase()
-    );
-    if (exists) {
-      alert("That card already exists.");
+    const { error } = await supabase.from("cards").insert([{ name: trimmed }]);
+    if (error) {
+      // If you enabled unique(lower(name)) this will catch duplicates too
+      alert(error.message);
       return;
     }
 
-    setCards((prev) => [
-      ...prev,
-      { id: uid(), name: trimmed, done: false, createdAt: Date.now() },
-    ]);
     setName("");
+    await loadCards();
   }
 
-  function bulkAdd() {
+  async function bulkAdd() {
     const items = splitBulk(bulkText);
     if (items.length === 0) return;
 
-    const existing = new Set(cards.map((c) => c.name.toLowerCase()));
-    const uniqueNew = [];
-
-    for (const item of items) {
-      const key = item.toLowerCase();
-      if (!existing.has(key)) {
-        existing.add(key);
-        uniqueNew.push(item);
+    // Dedup within the pasted list (case-insensitive)
+    const seen = new Set();
+    const unique = [];
+    for (const x of items) {
+      const k = x.toLowerCase();
+      if (!seen.has(k)) {
+        seen.add(k);
+        unique.push(x);
       }
     }
 
-    if (uniqueNew.length === 0) {
-      alert("Nothing new to add (all duplicates).");
+    // Insert in one request
+    const rows = unique.map((n) => ({ name: n }));
+    const { error } = await supabase.from("cards").insert(rows);
+
+    if (error) {
+      alert(error.message);
       return;
     }
 
-    const now = Date.now();
-    const newCards = uniqueNew.map((item, idx) => ({
-      id: uid(),
-      name: item,
-      done: false,
-      createdAt: now + idx,
-    }));
-
-    setCards((prev) => [...prev, ...newCards]);
     setBulkText("");
+    await loadCards();
   }
 
-  function toggleDone(id) {
-    setCards((prev) =>
-      prev.map((c) => (c.id === id ? { ...c, done: !c.done } : c))
-    );
+  // --- Supabase: update done ---
+  async function toggleDone(id, currentDone) {
+    const { error } = await supabase
+      .from("cards")
+      .update({ done: !currentDone })
+      .eq("id", id);
+
+    if (error) {
+      alert(error.message);
+      return;
+    }
+
     if (pickedId === id) setPickedId(null);
+    await loadCards();
   }
 
-  function removeCard(id) {
-    setCards((prev) => prev.filter((c) => c.id !== id));
+  // --- Supabase: delete ---
+  async function removeCard(id) {
+    const { error } = await supabase.from("cards").delete().eq("id", id);
+    if (error) {
+      alert(error.message);
+      return;
+    }
     if (pickedId === id) setPickedId(null);
+    await loadCards();
   }
 
-  // ✅ Working rolling baseline + ✅ Hard stop at exactly 5s
+  // --- Rolling (same as your first working version) ---
   function startRollingPick() {
-    if (isRollingRef.current) return;
+    if (isRolling) return;
 
     if (uncheckedCards.length === 0) {
       alert("No unchecked cards left. Add more in Manage Deck.");
       return;
     }
 
-    // clear any existing timers
-    if (rollingTimerRef.current) clearTimeout(rollingTimerRef.current);
-    if (hardStopTimerRef.current) clearTimeout(hardStopTimerRef.current);
-
     setIsRolling(true);
-    isRollingRef.current = true;
     setPickedId(null);
 
-    // seed with a first visible value
-    const seed = uncheckedCards[Math.floor(Math.random() * uncheckedCards.length)];
-    lastShownRef.current = { id: seed.id, name: seed.name };
-    setRollingName(seed.name);
-
-    // HARD STOP at 5 seconds: stop on whatever is currently displayed
-    hardStopTimerRef.current = setTimeout(() => {
-      if (!isRollingRef.current) return;
-
-      // stop rolling loop
-      if (rollingTimerRef.current) clearTimeout(rollingTimerRef.current);
-
-      const last = lastShownRef.current;
-      if (last?.id) {
-        setRollingName(last.name);
-        setPickedId(last.id);
-      }
-      setIsRolling(false);
-      isRollingRef.current = false;
-
-      if (hardStopTimerRef.current) clearTimeout(hardStopTimerRef.current);
-      hardStopTimerRef.current = null;
-    }, 5000);
-
-    // original rolling loop (boring but stable)
     const winner =
       uncheckedCards[Math.floor(Math.random() * uncheckedCards.length)];
 
     const steps = Math.min(40, Math.max(18, uncheckedCards.length * 3));
+
     let i = 0;
     let delay = 35;
 
     const tick = () => {
-      // if hard stop already happened, don't continue
-      if (!isRollingRef.current) return;
-
       i += 1;
 
       const randomCard =
         uncheckedCards[Math.floor(Math.random() * uncheckedCards.length)];
-      lastShownRef.current = { id: randomCard.id, name: randomCard.name };
       setRollingName(randomCard.name);
 
       delay = Math.floor(delay * 1.08 + 6);
@@ -180,17 +164,11 @@ export default function App() {
       if (i < steps) {
         rollingTimerRef.current = setTimeout(tick, delay);
       } else {
-        // normal finish
-        lastShownRef.current = { id: winner.id, name: winner.name };
         setRollingName(winner.name);
         setPickedId(winner.id);
 
-        if (hardStopTimerRef.current) clearTimeout(hardStopTimerRef.current);
-        hardStopTimerRef.current = null;
-
         rollingTimerRef.current = setTimeout(() => {
           setIsRolling(false);
-          isRollingRef.current = false;
         }, 250);
       }
     };
@@ -210,7 +188,13 @@ export default function App() {
           </p>
         </header>
 
-        {mode === "pick" ? (
+        {loading ? (
+          <div className="picked bigPicked">
+            <div className="pickedLabel">Loading</div>
+            <div className="pickedValue">Syncing from Supabase…</div>
+            <div className="pickedSub">If this hangs, check your .env and Vercel env vars.</div>
+          </div>
+        ) : mode === "pick" ? (
           <PickScreen
             unchecked={uncheckedCards.length}
             picked={picked}
@@ -267,7 +251,7 @@ function PickScreen({
           <div className="pickedValue">{displayName}</div>
           <div className="pickedSub">
             {isRolling
-              ? "Good luck… (max 5 seconds)"
+              ? "Good luck…"
               : picked
               ? "Tip: mark it done in Manage Deck to avoid repeats."
               : "Press Pick to choose from unchecked cards."}
@@ -366,10 +350,6 @@ function ManageScreen({
               Add
             </button>
           </div>
-
-          <div className="meta">
-            <span>Duplicates are blocked (case-insensitive).</span>
-          </div>
         </div>
 
         <div className="box">
@@ -391,9 +371,6 @@ function ManageScreen({
             <button className="btn primary" onClick={bulkAdd} disabled={!bulkText.trim()}>
               Add all
             </button>
-            <div className="smallHint">
-              Splits on <b>newline</b>, <b>,</b>, or <b>;</b>
-            </div>
           </div>
         </div>
       </section>
@@ -460,7 +437,7 @@ function ManageScreen({
                   <input
                     type="checkbox"
                     checked={c.done}
-                    onChange={() => toggleDone(c.id)}
+                    onChange={() => toggleDone(c.id, c.done)}
                   />
                   <span className="itemName">{c.name}</span>
                 </label>
