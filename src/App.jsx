@@ -17,10 +17,15 @@ export default function App() {
   const [cards, setCards] = useState([]);
   const [pickedId, setPickedId] = useState(null);
 
-  // rolling baseline (working)
+  // rolling baseline + hard stop
   const [isRolling, setIsRolling] = useState(false);
   const [rollingName, setRollingName] = useState("");
   const rollingTimerRef = useRef(null);
+  const hardStopTimerRef = useRef(null);
+
+  // refs to avoid stale state in timers
+  const isRollingRef = useRef(false);
+  const lastShownRef = useRef(null); // {id, name}
 
   const [loading, setLoading] = useState(true);
 
@@ -31,7 +36,6 @@ export default function App() {
     [pickedId, cards]
   );
 
-  // --- Supabase: load all cards ---
   async function loadCards() {
     setLoading(true);
     const { data, error } = await supabase
@@ -58,6 +62,7 @@ export default function App() {
   useEffect(() => {
     return () => {
       if (rollingTimerRef.current) clearTimeout(rollingTimerRef.current);
+      if (hardStopTimerRef.current) clearTimeout(hardStopTimerRef.current);
     };
   }, []);
 
@@ -68,7 +73,6 @@ export default function App() {
 
     const { error } = await supabase.from("cards").insert([{ name: trimmed }]);
     if (error) {
-      // If you enabled unique(lower(name)) this will catch duplicates too
       alert(error.message);
       return;
     }
@@ -81,7 +85,6 @@ export default function App() {
     const items = splitBulk(bulkText);
     if (items.length === 0) return;
 
-    // Dedup within the pasted list (case-insensitive)
     const seen = new Set();
     const unique = [];
     for (const x of items) {
@@ -92,7 +95,6 @@ export default function App() {
       }
     }
 
-    // Insert in one request
     const rows = unique.map((n) => ({ name: n }));
     const { error } = await supabase.from("cards").insert(rows);
 
@@ -132,31 +134,64 @@ export default function App() {
     await loadCards();
   }
 
-  // --- Rolling (same as your first working version) ---
+  // ✅ Rolling baseline + ✅ hard stop at 5s (keeps displayed)
   function startRollingPick() {
-    if (isRolling) return;
+    if (isRollingRef.current) return;
 
     if (uncheckedCards.length === 0) {
       alert("No unchecked cards left. Add more in Manage Deck.");
       return;
     }
 
+    // clear any existing timers
+    if (rollingTimerRef.current) clearTimeout(rollingTimerRef.current);
+    if (hardStopTimerRef.current) clearTimeout(hardStopTimerRef.current);
+
     setIsRolling(true);
+    isRollingRef.current = true;
     setPickedId(null);
 
+    // seed first value
+    const seed =
+      uncheckedCards[Math.floor(Math.random() * uncheckedCards.length)];
+    lastShownRef.current = { id: seed.id, name: seed.name };
+    setRollingName(seed.name);
+
+    // Hard stop after 5 seconds: stop on whatever is displayed
+    hardStopTimerRef.current = setTimeout(() => {
+      if (!isRollingRef.current) return;
+
+      if (rollingTimerRef.current) clearTimeout(rollingTimerRef.current);
+
+      const last = lastShownRef.current;
+      if (last?.id) {
+        setRollingName(last.name);
+        setPickedId(last.id);
+      }
+
+      setIsRolling(false);
+      isRollingRef.current = false;
+
+      if (hardStopTimerRef.current) clearTimeout(hardStopTimerRef.current);
+      hardStopTimerRef.current = null;
+    }, 5000);
+
+    // original stable rolling loop
     const winner =
       uncheckedCards[Math.floor(Math.random() * uncheckedCards.length)];
 
     const steps = Math.min(40, Math.max(18, uncheckedCards.length * 3));
-
     let i = 0;
     let delay = 35;
 
     const tick = () => {
+      if (!isRollingRef.current) return;
+
       i += 1;
 
       const randomCard =
         uncheckedCards[Math.floor(Math.random() * uncheckedCards.length)];
+      lastShownRef.current = { id: randomCard.id, name: randomCard.name };
       setRollingName(randomCard.name);
 
       delay = Math.floor(delay * 1.08 + 6);
@@ -164,11 +199,16 @@ export default function App() {
       if (i < steps) {
         rollingTimerRef.current = setTimeout(tick, delay);
       } else {
+        lastShownRef.current = { id: winner.id, name: winner.name };
         setRollingName(winner.name);
         setPickedId(winner.id);
 
+        if (hardStopTimerRef.current) clearTimeout(hardStopTimerRef.current);
+        hardStopTimerRef.current = null;
+
         rollingTimerRef.current = setTimeout(() => {
           setIsRolling(false);
+          isRollingRef.current = false;
         }, 250);
       }
     };
@@ -192,7 +232,9 @@ export default function App() {
           <div className="picked bigPicked">
             <div className="pickedLabel">Loading</div>
             <div className="pickedValue">Syncing from Supabase…</div>
-            <div className="pickedSub">If this hangs, check your .env and Vercel env vars.</div>
+            <div className="pickedSub">
+              If this hangs, check your .env and Vercel env vars.
+            </div>
           </div>
         ) : mode === "pick" ? (
           <PickScreen
@@ -251,7 +293,7 @@ function PickScreen({
           <div className="pickedValue">{displayName}</div>
           <div className="pickedSub">
             {isRolling
-              ? "Good luck…"
+              ? "Good luck… (hard stop at 5s)"
               : picked
               ? "Tip: mark it done in Manage Deck to avoid repeats."
               : "Press Pick to choose from unchecked cards."}
